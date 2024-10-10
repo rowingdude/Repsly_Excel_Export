@@ -30,20 +30,20 @@
 #        SOFTWARE.
 #
 
-
+import argparse
 import base64
+import concurrent.futures
 import functools
 import json
 import logging
 import os
 import requests
+import sys
 import time
 
-from datetime import datetime, timedelta
 from openpyxl import Workbook, load_workbook
-
-
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 
 ##############################################################################################################
 # These should be in environment variables if deploying this for prod, but we're just testing at the moment ##
@@ -54,115 +54,97 @@ BASE_URL = "https://api.repsly.com/v3/export"                                   
                                                                                                              #
 ##############################################################################################################
 
-
-# Repsly loves their *basic* base64 auth ...
 auth_header = base64.b64encode(f"{API_USERNAME}:{API_PASSWORD}".encode()).decode()
 headers = {
     "Authorization": f"Basic {auth_header}",
     "Content-Type": "application/json"
 }
 
-# Use @log_function_call for logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    file_handler = RotatingFileHandler('repsly_export.log', maxBytes=10*1024*1024, backupCount=5)
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(message)s')
+    console_handler.setFormatter(console_formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+logger = setup_logging()
+
 def log_function_call(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()
-        logging.debug(f"Starting {func.__name__}")
+        logger.debug(f"Starting {func.__name__}")
         result = func(*args, **kwargs)
         end_time = time.time()
-        logging.debug(f"Finished {func.__name__}. Execution time: {end_time - start_time:.2f} seconds")
+        logger.debug(f"Finished {func.__name__}. Execution time: {end_time - start_time:.2f} seconds")
         
         if func.__name__ == 'fetch_data':
             if result:
                 try:
-                    data_str = json.dumps(result, indent=2)[:1000]
-                    logging.debug(f"API Response Data (truncated to 1000 chars):\n{data_str}")
+                    #data_str = json.dumps(result, indent=2)[:1000]
+                    #logger.debug(f"API Response Data (truncated to 1000 chars):\n{data_str}")
                     
                     if isinstance(result, dict):
                         for key, value in result.items():
                             if isinstance(value, list):
-                                logging.debug(f"'{key}' contains {len(value)} items")
+                                logger.debug(f"'{key}' contains {len(value)} items")
                             elif isinstance(value, dict):
-                                logging.debug(f"'{key}' is a dictionary with {len(value)} key-value pairs")
+                                logger.debug(f"'{key}' is a dictionary with {len(value)} key-value pairs")
                     elif isinstance(result, list):
-                        logging.debug(f"Response is a list with {len(result)} items")
+                        logger.debug(f"Response is a list with {len(result)} items")
                 except Exception as e:
-                    logging.error(f"Error parsing API response: {str(e)}")
+                    logger.error(f"Error parsing API response: {str(e)}")
             else:
-                logging.warning("API response is empty or None")
+                logger.warning("API response is empty or None")
         
         if isinstance(result, str) and result.endswith('.xlsx'):
             try:
-                from openpyxl import load_workbook
                 wb = load_workbook(result)
                 for sheet_name in wb.sheetnames:
                     sheet = wb[sheet_name]
-                    logging.debug(f"Sheet '{sheet_name}' in {result} has {sheet.max_row} rows and {sheet.max_column} columns")
+                    logger.debug(f"Sheet '{sheet_name}' in {result} has {sheet.max_row} rows and {sheet.max_column} columns")
                     if sheet.max_row > 1:
                         first_data_row = list(sheet.iter_rows(min_row=2, max_row=2, values_only=True))[0]
-                        logging.debug(f"First data row in '{sheet_name}': {first_data_row}")
+                        logger.debug(f"First data row in '{sheet_name}': {first_data_row}")
                     else:
-                        logging.warning(f"Sheet '{sheet_name}' in {result} has no data rows")
+                        logger.warning(f"Sheet '{sheet_name}' in {result} has no data rows")
             except Exception as e:
-                logging.error(f"Error analyzing {result}: {str(e)}")
+                logger.error(f"Error analyzing {result}: {str(e)}")
         return result
     return wrapper
 
-def save_last_ids(workbook, last_ids):
-    if 'LastIDs' in workbook.sheetnames:
-        sheet = workbook['LastIDs']
-        workbook.remove(sheet)
-    
-    sheet = workbook.create_sheet('LastIDs')
-    sheet.append(['Endpoint', 'Last ID/Timestamp'])
-    
-    for endpoint, last_id in last_ids.items():
-        sheet.append([endpoint, last_id])
+def save_last_ids(last_ids, filename='last_ids.json'):
+    with open(filename, 'w') as f:
+        json.dump(last_ids, f, indent=2)
 
-## We use this as a template form to process each endpoint. We reference the MetaCollectionResult and then look for the next key
+def load_last_ids(filename='last_ids.json'):
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            return json.load(f)
+    return {}
 
-def process_data(endpoint, key_name, headers):
-    filename = f"Repsly_{key_name}_Export.xlsx"
-    wb = Workbook()
-    ws = wb.active
-    ws.title = key_name
-
-    ws.append(headers)
-
-    row_count = 0
-    last_id = 0
-    while True:
-        url = f"{BASE_URL}/{endpoint}/{last_id}"
-        data = fetch_data(url)
-
-        if data and key_name in data:
-            for item in data[key_name]:
-                row = [process_field(item.get(header)) for header in headers]
-                ws.append(row)
-                row_count += 1
-
-            meta = data.get('MetaCollectionResult', {})
-            new_last_id = meta.get('LastID') or meta.get('LastTimeStamp')
-            if new_last_id:
-                last_id = new_last_id
-            else:
-                break
-        else:
-            logging.warning(f"No '{key_name}' found in data from {url}")
-            break
-
-    wb.save(filename)
-    logging.info(f"{key_name} data saved to {filename}. Total rows: {row_count}")
-    return filename, last_id
-
+@log_function_call
 def fetch_data(url, params=None):
     response = requests.get(url, headers=headers, params=params)
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Error fetching data from {url}: {response.status_code}")
+        logging.error(f"Error fetching data from {url}: {response.status_code}")
         return None
-
 
 def process_field(value):
     if isinstance(value, list):
@@ -171,30 +153,65 @@ def process_field(value):
         return ', '.join(f"{k}:{v}" for k, v in value.items())
     return value
 
-##############################################################################################################
-#       These next functions are the API endpoint headers as described here:                                 #
-#             https://repsly-dev.readme.io/reference/getting-started-1                                       #
-##############################################################################################################
+@log_function_call
+def process_data(endpoint, key_name, headers, last_value=0, use_timestamp=False):
+    filename = f"Repsly_{key_name}_Export.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = key_name
+    ws.append(headers)
+    row_count = 0
+    
+    while True:
+        url = f"{BASE_URL}/{endpoint}/{last_value}"
+        data = fetch_data(url)
+        
+        if data and key_name in data:
+            for item in data[key_name]:
+                row = [process_field(item.get(header)) for header in headers]
+                ws.append(row)
+                row_count += 1
+            
+            meta = data.get('MetaCollectionResult', {})
+            if use_timestamp:
+                new_last_value = meta.get('LastTimeStamp')
+            else:
+                new_last_value = meta.get('LastID')
+            
+            if new_last_value is not None and new_last_value != last_value:
+                last_value = new_last_value
+            else:
+                break
+        else:
+            logging.warning(f"No '{key_name}' found in data from {url}")
+            break
 
-def process_clients():
+    wb.save(filename)
+    logging.info(f"{key_name} data saved to {filename}. Total rows: {row_count}")
+    return filename, last_value
+
+@log_function_call
+def process_clients(last_id=0):
     headers = [
         "ClientID", "TimeStamp", "Code", "Name", "Active", "Tag", "Territory",
         "RepresentativeCode", "RepresentativeName", "StreetAddress", "ZIP", "City",
         "State", "Country", "Email", "Phone", "Mobile", "Website", "ContactName",
         "ContactTitle", "Note", "Status", "CustomFields", "PriceLists", "AccountCode"
     ]
-    return process_data("clients", "Clients", headers)
+    return process_data("clients", "Clients", headers, last_id, use_timestamp=False)
 
-def process_client_notes():
+@log_function_call
+def process_client_notes(last_id=0):
     headers = [
         "ClientNoteID", "TimeStamp", "DateAndTime", "RepresentativeCode",
         "RepresentativeName", "ClientCode", "ClientName", "StreetAddress",
         "ZIP", "ZIPExt", "City", "State", "Country", "Email", "Phone",
         "Mobile", "Territory", "Longitude", "Latitude", "Note", "VisitID"
     ]
-    return process_data("clientnotes", "ClientNotes", headers)
+    return process_data("clientnotes", "ClientNotes", headers, last_id, use_timestamp=False)
 
-def process_visits():
+@log_function_call
+def process_visits(last_timestamp=0):
     headers = [
         "VisitID", "TimeStamp", "Date", "RepresentativeCode", "RepresentativeName",
         "ExplicitCheckIn", "DateAndTimeStart", "DateAndTimeEnd", "ClientCode",
@@ -202,9 +219,10 @@ def process_visits():
         "Territory", "LatitudeStart", "LongitudeStart", "LatitudeEnd", "LongitudeEnd",
         "PrecisionStart", "PrecisionEnd", "VisitStatusBySchedule", "VisitEnded"
     ]
-    return process_data("visits", "Visits", headers)
+    return process_data("visits", "Visits", headers, last_timestamp, use_timestamp=True)
 
-def process_retail_audits():
+@log_function_call
+def process_retail_audits(last_id=0):
     headers = [
         "RetailAuditID", "RetailAuditName", "Cancelled", "ClientCode", "ClientName",
         "DateAndTime", "RepresentativeCode", "RepresentativeName", "ProductGroupCode",
@@ -212,9 +230,10 @@ def process_retail_audits():
         "Promotion", "ShelfShare", "ShelfSharePercent", "SoldOut", "Stock",
         "CustomFields", "Note", "VisitID"
     ]
-    return process_data("retailaudits", "RetailAudits", headers)
+    return process_data("retailaudits", "RetailAudits", headers, last_id, use_timestamp=False)
 
-def process_purchase_orders():
+@log_function_call
+def process_purchase_orders(last_id=0):
     headers = [
         "PurchaseOrderID", "TransactionType", "DocumentTypeID", "DocumentTypeName",
         "DocumentStatus", "DocumentStatusID", "DocumentItemAttributeCaption",
@@ -228,16 +247,18 @@ def process_purchase_orders():
         "ZIPExt", "City", "State", "Country", "CountryCode", "CustomAttributes",
         "OriginalDocumentNumber"
     ]
-    return process_data("purchaseorders", "PurchaseOrders", headers)
+    return process_data("purchaseorders", "PurchaseOrders", headers, last_id, use_timestamp=False)
 
-def process_products():
+@log_function_call
+def process_products(last_id=0):
     headers = [
         "Code", "Name", "ProductGroupCode", "ProductGroupName", "Active", "Tag",
         "UnitPrice", "EAN", "Note", "ImageUrl", "MasterProduct", "PackagingCodes"
     ]
-    return process_data("products", "Products", headers)
+    return process_data("products", "Products", headers, last_id, use_timestamp=False)
 
-def process_forms():
+@log_function_call
+def process_forms(last_id=0):
     headers = [
         "FormID", "FormName", "ClientCode", "ClientName", "DateAndTime",
         "RepresentativeCode", "RepresentativeName", "StreetAddress", "ZIP",
@@ -245,16 +266,18 @@ def process_forms():
         "Territory", "Longitude", "Latitude", "SignatureURL", "VisitStart",
         "VisitEnd", "VisitID", "FormItems"
     ]
-    return process_data("forms", "Forms", headers)
+    return process_data("forms", "Forms", headers, last_id, use_timestamp=False)
 
-def process_photos():
+@log_function_call
+def process_photos(last_id=0):
     headers = [
         "PhotoID", "ClientCode", "ClientName", "Note", "DateAndTime", "PhotoURL",
         "RepresentativeCode", "RepresentativeName", "VisitID", "Tag"
     ]
-    return process_data("photos", "Photos", headers)
+    return process_data("photos", "Photos", headers, last_id, use_timestamp=False)
 
-def process_daily_working_time():
+@log_function_call
+def process_daily_working_time(last_id=0):
     headers = [
         "DailyWorkingTimeID", "Date", "DateAndTimeStart", "DateAndTimeEnd",
         "Length", "MileageStart", "MileageEnd", "MileageTotal", "LatitudeStart",
@@ -262,21 +285,16 @@ def process_daily_working_time():
         "RepresentativeName", "Note", "Tag", "NoOfVisits", "MinOfVisits",
         "MaxOfVisits", "MinMaxVisitsTime", "TimeAtClient", "TimeAtTravel"
     ]
-    return process_data("dailyworkingtime", "DailyWorkingTime", headers)
+    return process_data("dailyworkingtime", "DailyWorkingTime", headers, last_id, use_timestamp=False)
 
-##############################################################################################################
-#           Because of how Repsly tracks these (using a pair of timestamps...) we have to write these        #
-#               as bespoke functions for each endpoint...                                                    #
-##############################################################################################################
-
-def process_visit_schedules():
+@log_function_call
+def process_visit_schedules(last_id=None):
     headers = [
         "ScheduleDateAndTime", "RepresentativeCode", "RepresentativeName",
         "ClientCode", "ClientName", "StreetAddress", "ZIP", "ZIPExt", "City",
         "State", "Country", "Territory", "VisitNote", "DueDate"
     ]
     
-    # This endpoint requires date range, so we need a custom implementation
     filename = "Repsly_VisitSchedules_Export.xlsx"
     wb = Workbook()
     ws = wb.active
@@ -292,14 +310,15 @@ def process_visit_schedules():
     
     if data and 'VisitSchedules' in data:
         for schedule in data['VisitSchedules']:
-            ws.append([process_field(schedule.get(header)) for header in headers])
+            ws.append([schedule.get(header) for header in headers])
             row_count += 1
 
     wb.save(filename)
     logging.info(f"Visit Schedules data saved to {filename}. Total rows: {row_count}")
-    return filename
+    return filename, None
 
-def process_visit_realizations():
+@log_function_call
+def process_visit_realizations(last_id=None):
     headers = [
         "ScheduleId", "ProjectId", "EmployeeId", "EmployeeCode", "PlaceId",
         "PlaceCode", "ModifiedUTC", "TimeZone", "ScheduleNote", "Status",
@@ -336,35 +355,128 @@ def process_visit_realizations():
 
     wb.save(filename)
     logging.info(f"Visit Realizations data saved to {filename}. Total rows: {row_count}")
-    return filename
+    return filename, None
 
-def process_representatives():
+@log_function_call
+def process_representatives(last_id=None):
     headers = [
         "Code", "Name", "Note", "Email", "Phone", "Territories", "Active",
         "Address1", "Address2", "City", "State", "ZipCode", "ZipCodeExt",
         "Country", "CountryCode", "Attributes"
     ]
-    return process_data("representatives", "Representatives", headers)
+    filename = "Repsly_Representatives_Export.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Representatives"
+    ws.append(headers)
 
-def process_users():
+    url = f"{BASE_URL}/representatives"
+    data = fetch_data(url)
+    row_count = 0
+
+    if data and 'Representatives' in data:
+        for rep in data['Representatives']:
+            try:
+                attributes = rep.get('Attributes', [])
+                if attributes is None:
+                    attributes = []
+                attributes_str = ', '.join([f"{attr.get('Title', '')}:{attr.get('Type', '')}:{attr.get('Value', '')}" for attr in attributes])
+                
+                ws.append([
+                    rep.get('Code'),
+                    rep.get('Name'),
+                    rep.get('Note'),
+                    rep.get('Email'),
+                    rep.get('Phone'),
+                    ', '.join(rep.get('Territories', [])),
+                    rep.get('Active'),
+                    rep.get('Address1'),
+                    rep.get('Address2'),
+                    rep.get('City'),
+                    rep.get('State'),
+                    rep.get('ZipCode'),
+                    rep.get('ZipCodeExt'),
+                    rep.get('Country'),
+                    rep.get('CountryCode'),
+                    attributes_str
+                ])
+                row_count += 1
+            except Exception as e:
+                logging.error(f"Error processing representative: {rep.get('Code', 'Unknown')}. Error: {str(e)}")
+    else:
+        logging.warning("No 'Representatives' data found in the API response")
+
+    wb.save(filename)
+    logging.info(f"Representatives data saved to {filename}. Total rows: {row_count}")
+    return filename, None
+
+@log_function_call
+def process_users(last_timestamp=0):
     headers = [
         "ID", "Code", "Name", "Email", "Active", "Role", "Note", "Phone",
         "Territories", "SendEmailEnabled", "Address1", "Address2", "City",
         "State", "ZipCode", "ZipCodeExt", "Country", "CountryCode",
         "Attributes", "Permissions"
     ]
-    return process_data("users", "Users", headers)
+    return process_data("users", "Users", headers, last_timestamp, use_timestamp=True)
 
-
-def process_document_types():
+@log_function_call
+def process_document_types(last_id=None):
     headers = ["DocumentTypeID", "DocumentTypeName", "Statuses", "Pricelists"]
-    return process_data("documentTypes", "DocumentTypes", headers)
+    filename = "Repsly_DocumentTypes_Export.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "DocumentTypes"
+    ws.append(headers)
 
-def process_pricelists():
+    url = f"{BASE_URL}/documentTypes"
+    data = fetch_data(url)
+    row_count = 0
+    
+    if data and 'DocumentTypes' in data:
+        for doc_type in data['DocumentTypes']:
+            ws.append([
+                doc_type.get('DocumentTypeID'),
+                doc_type.get('DocumentTypeName'),
+                ', '.join([status.get('DocumentStatusName', '') for status in doc_type.get('Statuses', [])]),
+                ', '.join([pricelist.get('PricelistName', '') for pricelist in doc_type.get('Pricelists', [])])
+            ])
+            row_count += 1
+
+    wb.save(filename)
+    logging.info(f"Document Types data saved to {filename}. Total rows: {row_count}")
+    return filename, None
+
+@log_function_call
+def process_pricelists(last_id=None):
     headers = ["ID", "Name", "IsDefault", "Active", "UsePrices"]
-    return process_data("pricelists", "Pricelists", headers)
+    filename = "Repsly_Pricelists_Export.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Pricelists"
+    ws.append(headers)
 
-def process_pricelist_items():
+    url = f"{BASE_URL}/pricelists"
+    data = fetch_data(url)
+    row_count = 0
+    
+    if data and 'Pricelists' in data:
+        for pricelist in data['Pricelists']:
+            ws.append([
+                pricelist.get('ID'),
+                pricelist.get('Name'),
+                pricelist.get('IsDefault'),
+                pricelist.get('Active'),
+                pricelist.get('UsePrices')
+            ])
+            row_count += 1
+
+    wb.save(filename)
+    logging.info(f"Pricelists data saved to {filename}. Total rows: {row_count}")
+    return filename, None
+
+@log_function_call
+def process_pricelist_items(last_id=None):
     headers = [
         "PricelistID", "ID", "ProductID", "ProductCode", "Price", "Active",
         "ClientID", "ManufactureID", "DateAvailableFrom", "DateAvailableTo",
@@ -378,7 +490,8 @@ def process_pricelist_items():
     ws.append(headers)
 
     row_count = 0
-    pricelists_data = fetch_data(f"{BASE_URL}/pricelists")
+    pricelists_url = f"{BASE_URL}/pricelists"
+    pricelists_data = fetch_data(pricelists_url)
     
     if pricelists_data and 'Pricelists' in pricelists_data:
         for pricelist in pricelists_data['Pricelists']:
@@ -389,26 +502,52 @@ def process_pricelist_items():
                 
                 if data and isinstance(data, list):
                     for item in data:
-                        ws.append([process_field(item.get(header)) for header in headers])
+                        ws.append([
+                            pricelist_id,
+                            item.get('ID'),
+                            item.get('ProductID'),
+                            item.get('ProductCode'),
+                            item.get('Price'),
+                            item.get('Active'),
+                            item.get('ClientID'),
+                            item.get('ManufactureID'),
+                            item.get('DateAvailableFrom'),
+                            item.get('DateAvailableTo'),
+                            item.get('MinQuantity'),
+                            item.get('MaxQuantity')
+                        ])
                         row_count += 1
 
     wb.save(filename)
     logging.info(f"Pricelist Items data saved to {filename}. Total rows: {row_count}")
-    return filename
+    return filename, None
 
+def create_combined_workbook(filenames):
+    combined_wb = Workbook()
+    combined_wb.remove(combined_wb.active)  # Remove the default sheet
 
-    
-def process_endpoint(endpoint_func):
-    start_time = time.time()
-    filename = endpoint_func()
-    end_time = time.time()
-    print(f"Processing {filename} took {end_time - start_time:.2f} seconds")
-    return filename
+    for filename in filenames:
+        if os.path.exists(filename):
+            try:
+                wb = load_workbook(filename)
+                for sheet_name in wb.sheetnames:
+                    source_sheet = wb[sheet_name]
+                    new_sheet = combined_wb.create_sheet(sheet_name)
+                    
+                    for row in source_sheet.iter_rows(values_only=True):
+                        new_sheet.append(row)
+                
+                os.remove(filename)
+            except Exception as e:
+                logging.error(f"Error processing file {filename}: {str(e)}")
+        else:
+            logging.warning(f"File not found: {filename}")
 
+    if not combined_wb.sheetnames:
+        logging.warning("No data was combined. Creating a default sheet.")
+        combined_wb.create_sheet("Empty")
 
-##############################################################################################################
-#                 Though we don't really use this one yet, it's included for completeness.                   #
-##############################################################################################################
+    return combined_wb
 
 def process_import_status(import_job_id):
     headers = [
@@ -443,76 +582,112 @@ def process_import_status(import_job_id):
     logging.info(f"Import Status data saved to {filename}")
     return filename
 
-##############################################################################################################
-#                       A later revision of this will have us using one workbook from the start...           #
-#                           but for testing this is good enough. We're saving each to their own workbook     #
-#                              and then combining them at the end. It's ineffecient, I know.                 #
-##############################################################################################################
+def process_endpoint(endpoint_func):
+    start_time = time.time()
+    filename = endpoint_func()
+    end_time = time.time()
+    print(f"Processing {filename} took {end_time - start_time:.2f} seconds")
+    return filename
 
 def create_combined_workbook(filenames):
     combined_wb = Workbook()
     combined_wb.remove(combined_wb.active)  # Remove the default sheet
 
     for filename in filenames:
-        if filename and os.path.exists(filename):
-            wb = load_workbook(filename)
-            for sheet_name in wb.sheetnames:
-                source_sheet = wb[sheet_name]
-                new_sheet = combined_wb.create_sheet(sheet_name)
+        if os.path.exists(filename):
+            try:
+                wb = load_workbook(filename)
+                for sheet_name in wb.sheetnames:
+                    source_sheet = wb[sheet_name]
+                    new_sheet = combined_wb.create_sheet(sheet_name)
+                    
+                    for row in source_sheet.iter_rows(values_only=True):
+                        new_sheet.append(row)
                 
-                for row in source_sheet.iter_rows(values_only=True):
-                    new_sheet.append(row)
-            
-            # Optionally, remove the individual file after combining
-            os.remove(filename)
+                os.remove(filename)
+            except Exception as e:
+                logging.error(f"Error processing file {filename}: {str(e)}")
         else:
-            print(f"Warning: File not found or invalid filename: {filename}")
+            logging.warning(f"File not found: {filename}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    combined_filename = f"Repsly_Export_Combined_{timestamp}.xlsx"
-    combined_wb.save(combined_filename)
-    print(f"Combined workbook saved as {combined_filename}")
+    if not combined_wb.sheetnames:
+        logging.warning("No data was combined. Creating a default sheet.")
+        combined_wb.create_sheet("Empty")
 
-def main():
-    last_ids = {}
+    return combined_wb
+
+def main(modules=None):
+    last_ids = load_last_ids()
     filenames = []
 
-    endpoints = [
-        ('clients', process_clients),
-        ('clientnotes', process_client_notes),
-        ('visits', process_visits),
-        ('retailaudits', process_retail_audits),
-        ('purchaseorders', process_purchase_orders),
-        ('documentTypes', process_document_types),
-        ('products', process_products),
-        ('pricelists', process_pricelists),
-        ('pricelistItems', process_pricelist_items),
-        ('forms', process_forms),
-        ('photos', process_photos),
-        ('dailyworkingtime', process_daily_working_time),
-        ('visitschedules', process_visit_schedules),
-        ('visitrealizations', process_visit_realizations),
-        ('representatives', process_representatives),
-        ('users', process_users),
-    ]
+    all_endpoints = {
+        'representatives': process_representatives,
+        'visitschedules': process_visit_schedules,
+        'pricelistitems': process_pricelist_items,
+        'pricelists': process_pricelists,
+        'documenttypes': process_document_types,
+        'purchaseorders': process_purchase_orders,
+        'clients': process_clients,
+        'clientnotes': process_client_notes,
+        'visits': process_visits,
+        'retailaudits': process_retail_audits,
+        'products': process_products,
+        'forms': process_forms,
+        'photos': process_photos,
+        'dailyworkingtime': process_daily_working_time,
+        'visitrealizations': process_visit_realizations,
+        'users': process_users,
+    }
 
-    for endpoint, process_func in endpoints:
-        filename, last_id = process_func()
-        filenames.append(filename)
-        last_ids[endpoint] = last_id
+    if not modules:
+        modules = all_endpoints.keys()
 
-    import_job_id = None  
-    if import_job_id:
-        filename, _ = process_import_status(import_job_id)
-        filenames.append(filename)
+    logger.info("Starting Repsly data export...")
 
-    combined_workbook = create_combined_workbook(filenames)
-    save_last_ids(combined_workbook, last_ids)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    combined_filename = f"Repsly_Export_Combined_{timestamp}.xlsx"
-    combined_workbook.save(combined_filename)
-    logging.info(f"Combined workbook with LastIDs saved as {combined_filename}")
+    def process_module(module):
+        if module in all_endpoints:
+            logger.info(f"Processing {module}...")
+            process_func = all_endpoints[module]
+            try:
+                last_id = last_ids.get(module, 0)
+                filename, new_last_id = process_func(last_id)
+                if filename:
+                    logger.info(f"{module.capitalize()} data exported successfully.")
+                return module, filename, new_last_id
+            except Exception as e:
+                logger.error(f"Error processing {module}: {str(e)}", exc_info=True)
+                return module, None, None
+        else:
+            logger.warning(f"Unknown module: {module}")
+            return module, None, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_module = {executor.submit(process_module, module): module for module in modules}
+        for future in concurrent.futures.as_completed(future_to_module):
+            module, filename, new_last_id = future.result()
+            if filename:
+                filenames.append(filename)
+            if new_last_id is not None:
+                last_ids[module] = new_last_id
+
+    try:
+        combined_workbook = create_combined_workbook(filenames)
+        if combined_workbook:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            combined_filename = f"Repsly_Export_Combined_{timestamp}.xlsx"
+            combined_workbook.save(combined_filename)
+            logger.info(f"Combined workbook saved as {combined_filename}")
+        else:
+            logger.error("Failed to create combined workbook.")
+    except Exception as e:
+        logger.error(f"Error creating or saving combined workbook: {str(e)}", exc_info=True)
+
+    save_last_ids(last_ids)
+    logger.info("Repsly data export completed.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run Repsly data export modules.")
+    parser.add_argument('modules', nargs='*', help='Modules to run. If none specified, all modules will run.')
+    args = parser.parse_args()
+
+    main(args.modules)
