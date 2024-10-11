@@ -32,7 +32,7 @@
 
 import asyncio
 import aiohttp
-import aiostream
+import aiostream     # Future thoughts
 import argparse
 import base64
 import functools
@@ -48,19 +48,14 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from openpyxl import Workbook, load_workbook
 
-# API credentials
+BASE_URL = "https://api.repsly.com/v3/export"
 API_USERNAME = os.environ.get('REPSLY_API_USERNAME')
 API_PASSWORD = os.environ.get('REPSLY_API_PASSWORD')
 
 if not API_USERNAME or not API_PASSWORD:
     raise ValueError("API credentials not set. Please set REPSLY_API_USERNAME and REPSLY_API_PASSWORD environment variables.")
-# Base URL
-BASE_URL = "https://api.repsly.com/v3/export"
 
-# Generate base64 encoded auth header
 auth_header = base64.b64encode(f"{API_USERNAME}:{API_PASSWORD}".encode()).decode()
-
-# Headers for API requests
 headers = {
     "Authorization": f"Basic {auth_header}",
     "Content-Type": "application/json"
@@ -72,19 +67,16 @@ def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
-    # File handler (captures all logs)
     file_handler = RotatingFileHandler('repsly_export.log', maxBytes=10*1024*1024, backupCount=5)
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
 
-    # Console handler (captures INFO and above, plus full error messages)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(message)s')
     console_handler.setFormatter(console_formatter)
 
-    # Add handlers to logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
@@ -103,7 +95,6 @@ def log_function_call(func):
             url = args[0] if args else kwargs.get('url')
             if not result:
                 logger.error(f"Error fetching data from {url}")
-                # Log the raw response data here
                 response = kwargs.get('response')
                 if response:
                     logger.error(f"Status code: {response.status_code}")
@@ -140,7 +131,7 @@ def load_last_ids(filename='last_ids.json'):
             return json.load(f)
     return {}
 
-@log_function_call
+
 async def fetch_data(session, url, params=None):
     try:
         async with session.get(url, headers=headers, params=params) as response:
@@ -167,45 +158,45 @@ async def process_data_async(session, endpoint, key_name, headers, last_value=0,
     ws.title = key_name
     ws.append(headers)
     row_count = 0
-    chunk_size = 1000
+    save_interval = 50  # Save every 1000 rows
 
-    async def row_generator():
-        nonlocal last_value
-        while True:
-            url = f"{BASE_URL}/{endpoint}/{last_value}"
-            data, _ = await fetch_data(session, url)
-            
-            if data and key_name in data:
-                for item in data[key_name]:
-                    yield [process_field(item.get(header)) for header in headers]
-                
-                meta = data.get('MetaCollectionResult', {})
-                if use_timestamp:
-                    new_last_value = meta.get('LastTimeStamp')
-                else:
-                    new_last_value = meta.get('LastID')
-                
-                if new_last_value is not None and new_last_value != last_value:
-                    last_value = new_last_value
-                else:
-                    break
-            else:
-                logger.warning(f"No '{key_name}' found in data from {url}")
-                break
-
-    async for chunk in aiostream.stream.chunks(row_generator(), chunk_size):
-        for row in chunk:
-            ws.append(row)
-            row_count += 1
+    while True:
+        url = f"{BASE_URL}/{endpoint}/{last_value}"
+        data, _ = await fetch_data(session, url)
         
-        # Save progress periodically
-        wb.save(filename)
-        logger.debug(f"Saved progress for {key_name}. Current row count: {row_count}")
+        if data and key_name in data:
+            items = data[key_name]
+            for item in items:
+                row = [process_field(item.get(header)) for header in headers]
+                ws.append(row)
+                row_count += 1
 
+            if row_count % save_interval == 0:
+                wb.save(filename)
+                logger.debug(f"Saved progress for {key_name}. Current row count: {row_count}")
+
+            meta = data.get('MetaCollectionResult', {})
+            if use_timestamp:
+                new_last_value = meta.get('LastTimeStamp')
+            else:
+                new_last_value = meta.get('LastID')
+            
+            if new_last_value is not None and new_last_value != last_value:
+                last_value = new_last_value
+            else:
+                break  # No more data to fetch
+
+            if len(items) < 50:
+                break
+        else:
+            logger.warning(f"No '{key_name}' found in data from {url}")
+            break
+
+    wb.save(filename)
     logger.info(f"{key_name} data saved to {filename}. Total rows: {row_count}")
     return filename, last_value
 
-@log_function_call
+
 async def process_clients(session, last_id=0):
     headers = [
         "ClientID", "TimeStamp", "Code", "Name", "Active", "Tag", "Territory",
@@ -215,7 +206,7 @@ async def process_clients(session, last_id=0):
     ]
     return await process_data_async(session, "clients", "Clients", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_client_notes(session, last_id=0):
     headers = [
         "ClientNoteID", "TimeStamp", "DateAndTime", "RepresentativeCode",
@@ -225,7 +216,7 @@ async def process_client_notes(session, last_id=0):
     ]
     return await process_data_async(session, "clientnotes", "ClientNotes", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_visits(session, last_timestamp=0):
     headers = [
         "VisitID", "TimeStamp", "Date", "RepresentativeCode", "RepresentativeName",
@@ -236,7 +227,7 @@ async def process_visits(session, last_timestamp=0):
     ]
     return await process_data_async(session, "visits", "Visits", headers, last_timestamp, use_timestamp=True)
 
-@log_function_call
+
 async def process_retail_audits(session, last_id=0):
     headers = [
         "RetailAuditID", "RetailAuditName", "Cancelled", "ClientCode", "ClientName",
@@ -247,7 +238,7 @@ async def process_retail_audits(session, last_id=0):
     ]
     return await process_data_async(session, "retailaudits", "RetailAudits", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_purchase_orders(session, last_id=0):
     headers = [
         "PurchaseOrderID", "TransactionType", "DocumentTypeID", "DocumentTypeName",
@@ -264,7 +255,7 @@ async def process_purchase_orders(session, last_id=0):
     ]
     return await process_data_async(session, "purchaseorders", "PurchaseOrders", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_products(session, last_id=0):
     headers = [
         "Code", "Name", "ProductGroupCode", "ProductGroupName", "Active", "Tag",
@@ -272,7 +263,7 @@ async def process_products(session, last_id=0):
     ]
     return await process_data_async(session, "products", "Products", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_forms(session, last_id=0):
     headers = [
         "FormID", "FormName", "ClientCode", "ClientName", "DateAndTime",
@@ -283,7 +274,7 @@ async def process_forms(session, last_id=0):
     ]
     return await process_data_async(session, "forms", "Forms", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_photos(session, last_id=0):
     headers = [
         "PhotoID", "ClientCode", "ClientName", "Note", "DateAndTime", "PhotoURL",
@@ -291,7 +282,7 @@ async def process_photos(session, last_id=0):
     ]
     return await process_data_async(session, "photos", "Photos", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_daily_working_time(session, last_id=0):
     headers = [
         "DailyWorkingTimeID", "Date", "DateAndTimeStart", "DateAndTimeEnd",
@@ -302,7 +293,7 @@ async def process_daily_working_time(session, last_id=0):
     ]
     return await process_data_async(session, "dailyworkingtime", "DailyWorkingTime", headers, last_id, use_timestamp=False)
 
-@log_function_call
+
 async def process_visit_schedules(session, last_id=None):
     headers = [
         "ScheduleDateAndTime", "RepresentativeCode", "RepresentativeName",
@@ -320,20 +311,34 @@ async def process_visit_schedules(session, last_id=None):
     begin_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     url = f"{BASE_URL}/visitschedules/{begin_date}/{end_date}"
     
-    data, _ = await fetch_data(session, url)
-
     row_count = 0
-    
-    if data and 'VisitSchedules' in data:
-        for schedule in data['VisitSchedules']:
-            ws.append([schedule.get(header) for header in headers])
-            row_count += 1
+    save_interval = 1000
+
+    while True:
+        data, _ = await fetch_data(session, url)
+        
+        if data and 'VisitSchedules' in data:
+            for schedule in data['VisitSchedules']:
+                ws.append([process_field(schedule.get(header)) for header in headers])
+                row_count += 1
+
+            if row_count % save_interval == 0:
+                wb.save(filename)
+                logger.debug(f"Saved progress for Visit Schedules. Current row count: {row_count}")
+
+            if len(data['VisitSchedules']) < 50:
+                break
+            
+            last_schedule = data['VisitSchedules'][-1]
+            begin_date = last_schedule['ScheduleDateAndTime'].split('T')[0]
+            url = f"{BASE_URL}/visitschedules/{begin_date}/{end_date}"
+        else:
+            break
 
     wb.save(filename)
     logging.info(f"Visit Schedules data saved to {filename}. Total rows: {row_count}")
     return filename, None
 
-@log_function_call
 async def process_visit_realizations(session, last_id=None):
     headers = [
         "ScheduleId", "ProjectId", "EmployeeId", "EmployeeCode", "PlaceId",
@@ -352,6 +357,7 @@ async def process_visit_realizations(session, last_id=None):
     modified_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     skip = 0
     row_count = 0
+    save_interval = 1000
 
     while True:
         url = f"{BASE_URL}/visitrealizations"
@@ -363,7 +369,11 @@ async def process_visit_realizations(session, last_id=None):
                 ws.append([process_field(visit.get(header)) for header in headers])
                 row_count += 1
             
-            if len(data['VisitRealizations']) < 50:  
+            if row_count % save_interval == 0:
+                wb.save(filename)
+                logger.debug(f"Saved progress for Visit Realizations. Current row count: {row_count}")
+            
+            if len(data['VisitRealizations']) < 50:
                 break
             skip += 50
         else:
@@ -373,7 +383,6 @@ async def process_visit_realizations(session, last_id=None):
     logging.info(f"Visit Realizations data saved to {filename}. Total rows: {row_count}")
     return filename, None
 
-@log_function_call
 async def process_representatives(session, last_id=None):
     headers = [
         "Code", "Name", "Note", "Email", "Phone", "Territories", "Active",
@@ -387,46 +396,58 @@ async def process_representatives(session, last_id=None):
     ws.append(headers)
 
     url = f"{BASE_URL}/representatives"
-    data, _ = await fetch_data(session, url)
     row_count = 0
+    save_interval = 1000
 
-    if data and 'Representatives' in data:
-        for rep in data['Representatives']:
-            try:
-                attributes = rep.get('Attributes', [])
-                if attributes is None:
-                    attributes = []
-                attributes_str = ', '.join([f"{attr.get('Title', '')}:{attr.get('Type', '')}:{attr.get('Value', '')}" for attr in attributes])
-                
-                ws.append([
-                    rep.get('Code'),
-                    rep.get('Name'),
-                    rep.get('Note'),
-                    rep.get('Email'),
-                    rep.get('Phone'),
-                    ', '.join(rep.get('Territories', [])),
-                    rep.get('Active'),
-                    rep.get('Address1'),
-                    rep.get('Address2'),
-                    rep.get('City'),
-                    rep.get('State'),
-                    rep.get('ZipCode'),
-                    rep.get('ZipCodeExt'),
-                    rep.get('Country'),
-                    rep.get('CountryCode'),
-                    attributes_str
-                ])
-                row_count += 1
-            except Exception as e:
-                logging.error(f"Error processing representative: {rep.get('Code', 'Unknown')}. Error: {str(e)}")
-    else:
-        logging.warning("No 'Representatives' data found in the API response")
+    while True:
+        data, _ = await fetch_data(session, url)
+        
+        if data and 'Representatives' in data:
+            for rep in data['Representatives']:
+                try:
+                    attributes = rep.get('Attributes', [])
+                    if attributes is None:
+                        attributes = []
+                    attributes_str = ', '.join([f"{attr.get('Title', '')}:{attr.get('Type', '')}:{attr.get('Value', '')}" for attr in attributes])
+                    
+                    ws.append([
+                        rep.get('Code'),
+                        rep.get('Name'),
+                        rep.get('Note'),
+                        rep.get('Email'),
+                        rep.get('Phone'),
+                        ', '.join(rep.get('Territories', [])),
+                        rep.get('Active'),
+                        rep.get('Address1'),
+                        rep.get('Address2'),
+                        rep.get('City'),
+                        rep.get('State'),
+                        rep.get('ZipCode'),
+                        rep.get('ZipCodeExt'),
+                        rep.get('Country'),
+                        rep.get('CountryCode'),
+                        attributes_str
+                    ])
+                    row_count += 1
+
+                    if row_count % save_interval == 0:
+                        wb.save(filename)
+                        logger.debug(f"Saved progress for Representatives. Current row count: {row_count}")
+
+                except Exception as e:
+                    logging.error(f"Error processing representative: {rep.get('Code', 'Unknown')}. Error: {str(e)}")
+            
+            if len(data['Representatives']) < 50:
+                break
+            
+        else:
+            logging.warning("No 'Representatives' data found in the API response")
+            break
 
     wb.save(filename)
     logging.info(f"Representatives data saved to {filename}. Total rows: {row_count}")
     return filename, None
 
-@log_function_call
 async def process_users(session, last_timestamp=0):
     headers = [
         "ID", "Code", "Name", "Email", "Active", "Role", "Note", "Phone",
@@ -436,7 +457,7 @@ async def process_users(session, last_timestamp=0):
     ]
     return await process_data_async(session, "users", "Users", headers, last_timestamp, use_timestamp=True)
 
-@log_function_call
+
 async def process_document_types(session, last_id=None):
     headers = ["DocumentTypeID", "DocumentTypeName", "Statuses", "Pricelists"]
     filename = "Repsly_DocumentTypes_Export.xlsx"
@@ -463,8 +484,8 @@ async def process_document_types(session, last_id=None):
     logging.info(f"Document Types data saved to {filename}. Total rows: {row_count}")
     return filename, None
 
-@log_function_call
-async def process_pricelists(session,last_id=None):
+
+async def process_pricelists(session, last_id=None):
     headers = ["ID", "Name", "IsDefault", "Active", "UsePrices"]
     filename = "Repsly_Pricelists_Export.xlsx"
     wb = Workbook()
@@ -473,25 +494,37 @@ async def process_pricelists(session,last_id=None):
     ws.append(headers)
 
     url = f"{BASE_URL}/pricelists"
-    data, _ = await fetch_data(session, url)
     row_count = 0
+    save_interval = 1000
     
-    if data and 'Pricelists' in data:
-        for pricelist in data['Pricelists']:
-            ws.append([
-                pricelist.get('ID'),
-                pricelist.get('Name'),
-                pricelist.get('IsDefault'),
-                pricelist.get('Active'),
-                pricelist.get('UsePrices')
-            ])
-            row_count += 1
+    while True:
+        data, _ = await fetch_data(session, url)
+        
+        if data and 'Pricelists' in data:
+            for pricelist in data['Pricelists']:
+                ws.append([
+                    pricelist.get('ID'),
+                    pricelist.get('Name'),
+                    pricelist.get('IsDefault'),
+                    pricelist.get('Active'),
+                    pricelist.get('UsePrices')
+                ])
+                row_count += 1
+
+                if row_count % save_interval == 0:
+                    wb.save(filename)
+                    logger.debug(f"Saved progress for Pricelists. Current row count: {row_count}")
+
+            if len(data['Pricelists']) < 50:
+                break
+            
+        else:
+            break
 
     wb.save(filename)
     logging.info(f"Pricelists data saved to {filename}. Total rows: {row_count}")
-    return  filename, None
+    return filename, None
 
-@log_function_call
 async def process_pricelist_items(session,last_id=None):
     headers = [
         "PricelistID", "ID", "ProductID", "ProductCode", "Price", "Active",
@@ -597,8 +630,6 @@ async def process_import_status(session, import_job_id):
     wb.save(filename)
     logging.info(f"Import Status data saved to {filename}")
     return filename
-
-
 
 async def main(modules=None):
     last_ids = load_last_ids()
